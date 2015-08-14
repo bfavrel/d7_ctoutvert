@@ -1,0 +1,9 @@
+name = "Ctoutvert"
+description = "Provides Ctoutvert various functionalities."
+package = "Saison d'Or"
+core = 7.x
+
+dependencies[] = prestataires_dispos
+
+files[] = forms_plugins/fields/FormFieldCtoutvertSearch.class.php
+files[] = forms_plugins/widgets/FormWidgetCtoutvertSearch.class.php

@@ -1,0 +1,784 @@
+<?php
+
+function ctoutvert_get_products() {
+
+    return array(
+        'E|' => "Emplacement",
+        'L|3' => "Chalet",
+        'L|2' => "Bungalow",
+        'L|1' => "Mobilhome",
+        'L|4' => "Tente",
+        'L|10' => "Bungalow toilé",
+        'L|9' => "Caravane",
+        'L|11' => "Roulotte",
+        'L|13' => "Cabane",
+    );
+}
+
+function ctoutvert_field_extra_fields() {
+
+    $config = variable_get('ctoutvert_config', array());
+
+    $extra = array();
+
+    $extra['node'][$config['pdispos']['node_type']]['display'] = array(
+        'ctoutvert_node' => array(
+            'label' => t("Ctoutvert : node search form"),
+            'weight' => 0,
+        ),
+    );
+
+    return $extra;
+}
+
+function ctoutvert_menu() {
+    $items = array();
+
+    // ----- MODULE'S SETTINGS -----
+    $items['admin/config/ctoutvert'] = array(
+        'title' => "Ctoutvert",
+        'type' => MENU_NORMAL_ITEM,
+        'access arguments' => array('configure ctoutvert'),
+        'page callback' => 'system_admin_menu_block_page',
+        'file' => 'system.admin.inc',
+        'file path' => drupal_get_path('module', 'system'),
+        'position' => 'right',
+        'weight' => -30,
+    );
+
+    $items['admin/config/ctoutvert/settings'] = array(
+        'title' => "Configuration",
+        'description' => "General settings",
+        'type' => MENU_NORMAL_ITEM,
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('ctoutvert_settings_form'),
+        'file' => 'ctoutvert.admin.inc',
+        'access arguments' => array('configure ctoutvert'),
+    );
+
+    $items['admin/config/ctoutvert/autocomplete/field'] = array(
+        'type' => MENU_CALLBACK,
+        'page callback' => 'ctoutvert_settings_autocomplete_field',
+        'file' => 'ctoutvert.admin.inc',
+        'access arguments' => array('configure ctoutvert'),
+    );
+
+    return $items;
+}
+
+
+function ctoutvert_permission() {
+    return array(
+        'configure ctoutvert' => array(
+            'title' => t("Configure module"),
+        ),
+    );
+}
+
+function ctoutvert_cron($forced = false) {
+
+    $config = variable_get('ctoutvert_config', array());
+
+    if(empty($config) || ($config['cron']['active'] != true && $forced == false)) {return;}
+
+    $last_execution_time = variable_get('ctoutvert_last_cron', 0);
+
+    if($forced == false && !empty($last_execution_time)) {
+
+        $launch = false;
+
+        $time_windows = explode('|', $config['cron']['time_windows']);
+        array_walk($time_windows, function(&$val){
+            $val = explode('-', $val);
+        });
+
+        $last_execution = DateTime::createFromFormat('U', $last_execution_time);
+        $last_execution->setTimezone(new DateTimeZone('Europe/Paris'));
+        $last_execution_hour = $last_execution->format('G');
+        $last_execution_day = $last_execution->format('j');
+
+        $now = DateTime::createFromFormat('U', time());
+        $now->setTimezone(new DateTimeZone('Europe/Paris'));
+        $hour = $now->format('G');
+        $day = $now->format('j');
+
+        foreach($time_windows as $window) {
+
+            // on est actuellement dans une tranche programmée
+            if($hour >= $window[0] && $hour < $window[1]) {
+
+                // la dernière mise à jour a été faite aujourd'hui
+                if($last_execution_day == $day) {
+
+                    // elle a déjà eu lieu pour cette tranche horaire
+                    if($last_execution_hour >= $window[0]) {
+                        break;
+                    } else {
+                        $launch = true;
+                        break;
+                    }
+
+                // la dernière mise à jour ne date pas d'aujourd'hui
+                } else {
+                    $launch = true;
+                    break;
+                }
+            }
+        }
+
+        if($launch == false) {return;}
+    }
+
+    watchdog('ctoutvert', "Ctoutvert update started.", array(), WATCHDOG_INFO);
+
+    db_query("DELETE FROM {prestataires_dispos} WHERE layer=?", array($config['pdispos']['layer']));
+
+    $field_infos = field_info_field($config['settings']['field']);
+    $field_columns = reset($field_infos['storage']['details']['sql']['FIELD_LOAD_CURRENT']);
+    $field_value_column = $field_columns['value'];
+    $field_table = key($field_infos['storage']['details']['sql']['FIELD_LOAD_CURRENT']);
+
+    $from_date = new DateTime();
+    $to_date = clone $from_date;
+    $to_date->modify('+' . max($config['cron']['period_length'] - 1, 1) . ' day'); // '-1' car le jour d'aujourd'hui compte. '1' car Ctoutvert refuse les dates identiques
+
+    $dates_period = new DatePeriod($from_date, new DateInterval('P1D'), $to_date);
+
+    $ctoutvert_products = ctoutvert_get_products();
+    array_walk($ctoutvert_products, function(&$val){
+        $val = array();
+    });
+
+    $ctoutvert_products = array_intersect_key($ctoutvert_products, array_filter($config['pdispos']['products_mappings']));
+
+    $period_pattern = array();
+
+    foreach($dates_period as $date) {
+        $period_pattern[$date->format('Y-m-d')] = $ctoutvert_products;
+    }
+
+    $data = ctoutvert_call(
+        $from_date->format('Y-m-d'),
+        $to_date->format('Y-m-d')
+    );
+
+    if($data == false) {
+        watchdog('ctoutvert', "Ctoutvert update ended with no results", array(), WATCHDOG_INFO);
+        variable_set('ctoutvert_last_cron', time());
+        return;
+    }
+
+    $slice_pattern = array(
+        'period' => array(
+            'date_from' => '',
+            'date_to' => '',
+        ),
+        'type' => $config['pdispos']['availabilities_type'],
+        'layer' => $config['pdispos']['layer'],
+        'capacity' => -1,
+        'infos' => array(),
+    );
+
+    $reset_from = DateTime::createFromFormat('Y-m-d', date('Y-m-01'));
+    $reset_to = clone $reset_from;
+    $reset_to->modify('+1 year');
+
+    $reset_slice = array(
+        'period' => array(
+            'date_from' => $reset_from->format('Y-m-d'),
+            'date_to' => $reset_to->format('Y-m-d'),
+        ),
+        'type' => $config['pdispos']['default_type'],
+        'layer' => $config['pdispos']['layer'],
+        'capacity' => 0,
+        'infos' => array(),
+    );
+
+    $dispos = array();
+    $num_periods = 0;
+    $nids = array();
+
+    //----- les établissements
+    foreach($data->availabilityInformationList->availabilityInformations as $infos) {
+
+        $products_infos = $infos->productInformationsList->productInformations;
+
+        $nid = db_query(
+            "SELECT n.nid FROM {" . $field_table . "} AS f
+             LEFT JOIN {node} AS n ON n.nid=f.entity_id AND n.language='fr'
+             WHERE f." . $field_value_column . "=?",
+            array($infos->establishmentInformation->establishmentId)
+        )->fetchColumn();
+
+        if(empty($nid)) {continue;}
+
+        $nids[] = $nid;
+
+        $dispos[$nid] = array(
+            'nid' => $nid,
+            'days' => $period_pattern,
+        );
+
+        //----- les produits de chaque établissement
+        foreach($products_infos as $sub_infos) {
+
+            $product_from_date = DateTime::createFromFormat('Y-m-d\TH:i:s', $sub_infos->productAvailabilityDate->dateBegin);
+            if($product_from_date < $from_date) {$product_from_date = clone $from_date;}
+
+            $product_to_date = DateTime::createFromFormat('Y-m-d\TH:i:s', $sub_infos->productAvailabilityDate->dateEnd);
+            if($product_to_date > $to_date) {$product_to_date = clone $to_date;}
+
+            $product_period = new DatePeriod($product_from_date, new DateInterval('P1D'), $product_to_date);
+
+            foreach($product_period as $date) {
+                $dispos[$nid]['days'][$date->format('Y-m-d')][$sub_infos->productType . '|' . $sub_infos->productCategoryId][] = $sub_infos->productId;
+            }
+        }
+
+        //----- mapping so_forms
+        foreach($dispos[$nid]['days'] as $date => $products) {
+            $mapped = array();
+            $products = array_filter($products);
+
+            array_walk($products, function(&$val, $key) {
+                $val = count(array_unique($val));
+            });
+
+            foreach($products as $ctoutvert_product => $qty) {
+                $mapped[$config['pdispos']['products_mappings'][$ctoutvert_product]] = $qty;
+            }
+
+            $dispos[$nid]['days'][$date] = $mapped;
+        }
+
+        //----- slices
+        $slices = array($reset_slice);
+
+        reset($dispos[$nid]['days']);
+
+        $slice_start = key($dispos[$nid]['days']);
+        $slice_end = $slice_start;
+        $previous_values = array_shift($dispos[$nid]['days']);
+        $dispos[$nid]['days'][] = array(); // "point d'arrêt"
+
+        $weight = 0;
+
+        foreach($dispos[$nid]['days'] as $day => $values) {
+
+            if($values == $previous_values) {
+                $slice_end = $day;
+                continue;
+            }
+
+            $slice_tmp = $slice_pattern;
+
+            $slice_tmp['period']['date_from'] = $slice_start;
+            $slice_tmp['period']['date_to'] = $slice_end;
+
+            foreach($previous_values as $sfid => $qty) {
+
+                $slice_tmp['infos'][] = array(
+                    'field_id' => $sfid,
+                    'weight' => $weight++,
+                    'quantity' => $qty,
+                    'capacity' => -1,
+                    'comment' => "",
+                    'raw_inputs' => serialize(array(
+                        'quantity' => $qty,
+                        'comment' => "",
+                    )),
+                );
+
+            }
+
+            $slices[] = $slice_tmp;
+
+            $slice_start = $day;
+            $slice_end = $day;
+            $previous_values = $values;
+        }
+
+        prestataires_dispos_save_periods($nid, $slices);
+        $num_periods += count($slices) - 1; // - 1 : période de "reset"
+    }
+
+    watchdog(
+        'ctoutvert', "Ctoutvert update finished.<br />@num_periods periods wrotten in @num_nodes nodes.<br />(@nids)",
+        array(
+            '@num_periods' => $num_periods,
+            '@num_nodes' => count($nids),
+            '@nids' => implode(',', $nids),
+        ),
+        WATCHDOG_INFO
+    );
+
+    variable_set('ctoutvert_last_cron', time());
+}
+
+function ctoutvert_call($from_date, $to_date, $num_people = 0, $accurate = false, $id_filter = array(), $product_type_filter = array('noFilter')) {
+
+    $config = variable_get('ctoutvert_config', array());
+
+    $arguments = array(
+        'user' => $config['settings']['user'],
+        'password' => $config['settings']['pwd'],
+        'idEngine' => $config['settings']['id_engine'],
+        'isoLanguageCode' => 'FR',
+        'domainCodeList' => array(),
+        'productIdList' => array(),
+        'arrivalDate' => $from_date,
+        'departureDate' => $to_date,
+        'maxDaysVariationOnArrivalDate' => $accurate == true ? 0 : 7,
+        'searchOnExactDatesOnly' => $accurate,
+        'productTypeCodeList' => $product_type_filter,// array('L', 'E', 'C', 'noFilter') : 'E'mplacement, 'L'ocation, 'C'hambre
+        'subTypeCodeList' => array(),
+        'calcSpecialOffer' => true,
+        'returnInfoProduct' => true,
+        'idEstablishmentList' => $id_filter,
+    );
+
+    if($num_people > 0) {
+        $arguments['persNumber'] = $num_people;
+    }
+
+    $wsdl = "http://webservices.secureholiday.net/v2/engine.asmx?wsdl";
+    $service = new SoapClient($wsdl, array('connection_timeout' => 45));
+
+    $call = $service->engine_returnAvailability($arguments);
+    $response = $call->engine_returnAvailabilityResult;
+
+    if(property_exists($response, "availabilityInformationList")) {
+
+        if(!is_array($response->availabilityInformationList->availabilityInformations)) {
+            $response->availabilityInformationList->availabilityInformations = array($response->availabilityInformationList->availabilityInformations);
+        }
+
+        foreach($response->availabilityInformationList->availabilityInformations as $index => $infos) {
+
+            if(!is_array($infos->productInformationsList->productInformations)) {
+                $response->availabilityInformationList->availabilityInformations[$index]->productInformationsList->productInformations = array($infos->productInformationsList->productInformations);
+            }
+
+        }
+
+        return $response;
+
+    } else {
+        return false;
+    }
+}
+
+function ctoutvert_so_forms($module, $id) {
+
+    if($module == 'so_listings') {
+        $infos = explode('@', $id);
+        if($infos[1] != 'search') {return;}
+    } else {
+        return;
+    }
+
+    return array(
+        'fields_definitions' => array(
+            'ctoutvert_search' => array(
+                'label' => t("Search by availabilities"),
+                'type' => 'ctoutvert_search',
+            ),
+        ),
+        'types_definitions' => array(
+            'ctoutvert_search' => array(
+                'label' => "Availabilities",
+                'class' => 'FormFieldCtoutvertSearch',
+            ),
+        ),
+        'widgets_definitions' => array(
+            'ctoutvert_search_widget' => array(
+                'label' => "Ctoutvert search widget",
+                'class' => 'FormWidgetCtoutvertSearch',
+            ),
+        ),
+    );
+}
+
+function ctoutvert_so_listings_search($field, &$query, &$data) {
+
+    if($field['values']['from'] == null && $field['values']['to'] == null) {return;}
+
+    $config = variable_get('ctoutvert_config', array());
+
+    $field_infos = field_info_field($config['settings']['field']);
+    $field_columns = reset($field_infos['storage']['details']['sql']['FIELD_LOAD_CURRENT']);
+    $field_value_column = $field_columns['value'];
+    $field_table = key($field_infos['storage']['details']['sql']['FIELD_LOAD_CURRENT']);
+
+    $nid_results = db_query("SELECT entity_id," . $field_value_column . " AS ctoutvert_id FROM {" . $field_table . "} WHERE " . $field_value_column . "!=''");
+
+    $ctoutvert_nids = array();
+    $ctoutvert_ids = array();
+
+    while($row = $nid_results->fetchObject()) {
+        $ctoutvert_nids[$row->entity_id] = $row->ctoutvert_id;
+        $ctoutvert_ids[$row->ctoutvert_id] = $row->entity_id;
+    }
+
+    $ctoutverts_nodes_available = array();
+
+    $control = md5(serialize($field['values']));
+
+    if(array_key_exists('ctoutvert_search', $_SESSION)
+                && $_SESSION['ctoutvert_search']['timestamp'] > (time() - 60 * 30)  // TODO : passer ça en config
+                    && $_SESSION['ctoutvert_search']['control'] == $control) {
+
+        $ctoutverts_nodes_available = $_SESSION['ctoutvert_search']['results'];
+
+    } else {
+
+        $_SESSION['ctoutvert_search'] = array(
+            'timestamp' => time(),
+            'control' => $control,
+            'search' => $field['values'],
+            'results' => array(),
+        );
+
+        $ctoutvert_dispos = ctoutvert_call(
+            $field['values']['from'],
+            $field['values']['to'],
+            $field['values']['capacity'],
+            $field['values']['accuracy'],
+            array_values($ctoutvert_nids),
+            $field['values']['types']
+        );
+
+        if(property_exists($ctoutvert_dispos, 'availabilityInformationList')
+                && property_exists($ctoutvert_dispos->availabilityInformationList, 'availabilityInformations')
+                    && !empty($ctoutvert_dispos->availabilityInformationList->availabilityInformations)) {
+
+            foreach($ctoutvert_dispos->availabilityInformationList->availabilityInformations as $ctoutvert_infos) {
+                $ctoutverts_nodes_available[] = $ctoutvert_ids[$ctoutvert_infos->establishmentInformation->establishmentId];
+            }
+        }
+
+        $_SESSION['ctoutvert_search']['results'] = $ctoutverts_nodes_available;
+    }
+
+    $query['#context'][] = 'pdispos_search';
+
+    $pdispos_settings = variable_get('prestataires_dispos_settings', array());
+
+    $dispos = prestataires_dispos_search_dispos(
+        array(
+            'from' => $field['values']['from'],
+            'to' => $field['values']['to'],
+        ),
+        array(
+            'capacity' => $field['values']['capacity'],
+            'accuracy' => $field['values']['accuracy'],
+            'shift_dates' => array(
+                'start' => $field['configuration']['shift_dates']['start'],
+                'end' => $field['configuration']['shift_dates']['end'],
+            ),
+            'undefined_mode' => $field['configuration']['undefined_mode'],
+            'debug_mode' => $pdispos_settings['configuration']['debug_mode'],
+        )
+    );
+
+    $to_remove = array_intersect_key($dispos['nids'], $ctoutvert_nids);
+    $dispos['ids'] = array_diff($dispos['ids'], $to_remove);
+    $dispos['nids'] = array_diff_key($dispos['nids'], $to_remove);
+
+    $id_fragment = so_listings_prepare_query_fragment_data('id@prestataires_dispos');
+
+    // PROBLEME : les nodes Ctoutvert qui ont également des dispos PDispos génèrent plusieurs lignes par nodes :
+    // "SELECT DISTINCT n.nid, prestataires_dispos.id AS prestataires_dispos_id ...".
+    //
+    //$query['fields'][] = $id_fragment->fields[0] . " AS prestataires_dispos_id";
+    $query['join'][] = $id_fragment->joins[0];
+
+    // on push ce "0" pour éviter une clause IN vide, tout en invalidant la totalité du listing en cas de réponse vide.
+    $dispos['ids'][] = 0;
+    $ctoutverts_nodes_available[] = 0;
+
+    $query['where'][] = "(" .
+                            "(" . $id_fragment->fields[0] . " IN(" . implode(',', $dispos['ids']) . "))" .
+                            " OR " .
+                            "(n.nid IN(" . implode(',', $ctoutverts_nodes_available) . "))" .
+                        ")";
+
+    $data = $dispos['data'];
+    $data['relevant_nodes'] = array_unique(array_merge($data['relevant_nodes'], $ctoutverts_nodes_available));
+    $data['ctoutvert_nodes'] = $ctoutverts_nodes_available;
+}
+
+function ctoutvert_so_listings_sorting() {
+
+    return array(
+        'ctoutvert_relevance' => array(
+            'label' => t("Sorting by availabilities search relevance") . " (Ctoutvert)",
+            'callback' => 'ctoutvert_so_listings_sorting_relevance_callback',
+            'cache' => false,
+            'contexts' => array('pdispos_search'),
+        ),
+    );
+}
+
+function ctoutvert_so_listings_sorting_relevance_callback($context = null, &$data = null) {
+
+    if($context == null) {return 'ctoutvert';}
+
+    return prestataires_dispos_so_listings_sorting_relevance_callback($context, $data);
+}
+
+function ctoutvert_so_listings_node(&$node, $node_fields, $data) {
+
+    prestataires_dispos_so_listings_node($node, $node_fields, $data);
+}
+
+function ctoutvert_node_view($node, $view_mode, $langcode) {
+
+    $config = variable_get('ctoutvert_config', array());
+
+    if($node->type != $config['pdispos']['node_type'] || $view_mode != 'full') {return;}
+
+    if(empty($node->{$config['settings']['field']})) {return;}
+
+    $ctoutvert_id = $node->{$config['settings']['field']}['und'][0]['value'];
+
+    $node->content['ctoutvert_node'] = drupal_get_form('ctoutvert_node_search_form', $ctoutvert_id);
+}
+
+function ctoutvert_node_search_form($form, &$form_state, $ctoutvert_id) {
+
+    if(array_key_exists('values', $form_state)) {
+        $values = $form_state['values'];
+    } elseif(array_key_exists('ctoutvert_search', (array)$_SESSION)) {
+        $values = $_SESSION['ctoutvert_search']['search'];
+    } else {
+        $values = array(
+            'from' => null,
+            'to' => null,
+            'capacity' => null,
+            'accuracy' => 0,
+            'types' => array(
+                'E' => 'E',
+                'L' => 'L',
+            ),
+        );
+    }
+
+    $form = array(
+        '#attributes' => array('class' => array('clearfix')),
+        
+        'search' => array(
+            '#theme' => 'ctoutvert_node_search',
+            '#type' => 'container',
+
+            'from' => array(
+                '#type' => 'date_popup',
+                '#date_format' => 'd/m/Y',
+                '#date_year_range' => '0:+1',
+                '#title' => t("From@date", array('@date' => null)),
+                '#title_display' => 'invisible',
+                '#process' => array('prestataires_dispos_process_date_popup'),
+                '#default_value' => $values['from'],
+            ),
+
+            'to' => array(
+                '#type' => 'date_popup',
+                '#date_format' => 'd/m/Y',
+                '#date_year_range' => '0:+1',
+                '#title' => t("To@date", array('@date' => null)),
+                '#title_display' => 'invisible',
+                '#process' => array('prestataires_dispos_process_date_popup'),
+                '#default_value' => $values['to'],
+            ),
+
+            'capacity' => array(
+                '#type' => 'textfield',
+                '#title' => null,
+                '#field_prefix' => t("For@npeople", array('@npeople' => null)),
+                '#field_suffix' => t("people@optionalplurial", array('@optionalplurial' => null)),
+                '#size' => 1,
+                '#default_value' => $values['capacity'],
+                '#attributes' => array('placeholder' => "?"),
+            ),
+
+            'accuracy' => array(
+                '#type' => 'checkbox',
+                '#title' => t("Results on exact dates only"),
+                '#default_value' => $values['accuracy'],
+            ),
+
+            'types' => array(
+                '#type' => 'checkboxes',
+                '#title' => t("Type"),
+                '#options' => array(
+                    'E' => t("Pitch"),
+                    'L' => t("Rental"),
+                ),
+                '#default_value' => array_filter($values['types']),
+            ),
+
+            'search' => array(
+                '#type' => 'submit',
+                '#value' => t("Search"),
+                '#ajax' => array(
+                    'callback' => 'ctoutvert_node_search_form_ajax_callback',
+                    'wrapper' => 'ctoutvert-results-wrapper',
+                    'effect' => 'fade',
+                    'event' => 'click',
+                    'method' => 'replace',
+                    'progress' => array(
+                        'type' => 'throbber',
+                        'message' => t("We search for availabilities"),
+                    ),
+                ),
+            ),
+        ),
+
+        'results' => array(
+            '#type' => 'container',
+            '#id' => 'ctoutvert-results-wrapper',
+            '#theme' => 'ctoutvert_node_search_results',
+        ),
+    );
+
+    if(empty($form_state['input']) == !array_key_exists('values', $form_state) // on ne sollicite pas Ctoutvert lors de la reconstruction du form après submission
+            && !empty($values['from']) && !empty($values['to'])) {
+
+        $response = ctoutvert_call(
+            $values['from'],
+            $values['to'],
+            $values['capacity'],
+            $values['accuracy'],
+            $id_filter = array($ctoutvert_id),
+            array_values(array_filter($values['types']))
+        );
+
+        $products = $response->availabilityInformationList->availabilityInformations[0]->productInformationsList->productInformations;
+
+        if(!empty($products)) {
+            foreach($products as $product) {
+
+                if(empty($product)) {continue;}
+
+                $form['results'][] = array(
+                    'product' => array(
+                        '#markup' => $product->productName,
+                    ),
+
+                    'num_people' => array(
+                        '#markup' => t("For @from to @to people", array('@from' => $product->productNbPersMin, '@to' => $product->productNbPersMax)),
+                    ),
+
+                    'dates' => array(
+                        '#markup' => $product->productAvailabilityDate->txtFinalDates,
+                    ),
+
+                    'price' => array(
+                        '#markup' => t("From @price €", array('@price' => str_replace('.', ',', str_replace('.00', '', number_format($product->productPrice->priceWithMinimalOptions, 2))))),
+                    ),
+
+                    'details' => array(
+                        '#markup' => l(
+                            t("Details"),
+                            $product->urlProduct,
+                            array(
+                                'attributes' => array('class' => array('colorbox-load')),
+                                'external' => true,
+                                'query' => array('iframe' => 'true', 'width' => '80%', 'height' => '80%'),
+                            )
+                        ),
+                    ),
+
+                    'booking' => array(
+                        '#markup' => l(
+                            t("Booking"),
+                            $product->urlBooking,
+                            array(
+                                'attributes' => array('class' => array('colorbox-load')),
+                                'external' => true,
+                                'query' => array('iframe' => 'true', 'width' => '80%', 'height' => '80%'),
+                            )
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+
+    if(count(element_children($form['results'])) == 0) {
+        $form['results']['no_result'] = array(
+            '#prefix' => "<div class='ctoutvert-no-result'>",
+            '#markup' => "- " . t("There is no result") . " -",
+            '#suffix' => "</div>",
+        );
+    }
+
+    return $form;
+}
+
+function ctoutvert_node_search_form_ajax_callback($form, &$form_state) {
+    return $form['results'];
+}
+
+function ctoutvert_node_search_form_submit($form, &$form_state) {
+    $form_state['rebuild'] = true;
+}
+
+function ctoutvert_prestataire_dispos_display_calendar($node) {
+
+    $config = variable_get('ctoutvert_config', array());
+    return !empty($node->{$config['settings']['field']});
+}
+
+function ctoutvert_theme() {
+    return array(
+        'ctoutvert_pdispos_settings' => array(
+            'render element' => 'element',
+            'file' => 'ctoutvert.admin.inc',
+        ),
+        'ctoutvert_node_search' => array(
+            'render element' => 'element',
+        ),
+        'ctoutvert_node_search_results' => array(
+            'render element' => 'element',
+        ),
+    );
+}
+
+function theme_ctoutvert_node_search($vars) {
+    $output = "";
+
+    $element = $vars['element'];
+
+    $output .= "<h2>" . t("Availabilities search") . "</h2>";
+    $output .= render($element['from']);
+    $output .= render($element['to']);
+    $output .= render($element['capacity']);
+    $output .= render($element['types']);
+    $output .= render($element['accuracy']);
+    $output .= render($element['search']);
+
+    return $output;
+}
+
+function theme_ctoutvert_node_search_results($vars) {
+    $output = "";
+
+    $element = $vars['element'];
+
+    if(array_key_exists('no_result', $element)) {
+        return render($element['no_result']);
+    }
+
+    foreach(element_children($element) as $product) {
+
+        $output .= "<div class='ctoutvert-result-wrapper clearfix'>";
+        $output .= "<div class='ctoutvert-result_header'>" . render($element[$product]['product']) . "<br />" . render($element[$product]['num_people']) . "</div>";
+        $output .= "<div class='ctoutvert-result_dates'>" . render($element[$product]['dates']) . "</div>";
+        $output .= "<div class='ctoutvert-result-links'>" . render($element[$product]['details']) . " / " . render($element[$product]['booking']) . "</div>";
+        $output .= "<div class='ctoutvert-result_price'>" . render($element[$product]['price']) . "</div>";
+        $output .= "</div>";
+    }
+
+    return $output;
+}
